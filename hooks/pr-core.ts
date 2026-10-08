@@ -5,15 +5,27 @@ import type { PrChecks, PrReadiness, TrackedPr } from '../types'
 
 export const MAX_PRS = 10
 
-export const LIST_QUERY = `query {
-  viewer {
-    login
-    pullRequests(first: ${MAX_PRS}, states: OPEN, orderBy: { field: UPDATED_AT, direction: DESC }) {
-      totalCount
-      nodes { number title url isDraft headRefName repository { nameWithOwner } }
-    }
-  }
+export type PrRole = 'author' | 'reviewer'
+
+// The GitHub project a git remote points at, as `owner/name`.
+export function repoFromRemote(url: string): string | null {
+  const match = url.trim().match(/github\.com[:/]+([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/)
+
+  return match ? `${match[1]}/${match[2]}` : null
+}
+
+const LISTED_FIELDS = 'nodes { ... on PullRequest { number title url isDraft headRefName repository { nameWithOwner } author { login } } }'
+
+// Open, non-draft PRs in one project that you wrote or were asked to review.
+export function listQuery(repo: string): string {
+  const scope = `repo:${repo} is:pr is:open draft:false`
+
+  return `query {
+  viewer { login }
+  mine: search(query: ${JSON.stringify(`${scope} author:@me`)}, type: ISSUE, first: ${MAX_PRS}) { ${LISTED_FIELDS} }
+  review: search(query: ${JSON.stringify(`${scope} review-requested:@me`)}, type: ISSUE, first: ${MAX_PRS}) { ${LISTED_FIELDS} }
 }`
+}
 
 export type ListedPr = {
   number: number
@@ -22,10 +34,36 @@ export type ListedPr = {
   isDraft: boolean
   headRefName: string
   repository: { nameWithOwner: string }
+  author: { login: string } | null
+  role: PrRole
 }
 
+type Found = Omit<ListedPr, 'role'>
+
 export type ListAnswer = {
-  data?: { viewer?: { login: string; pullRequests: { totalCount: number; nodes: ListedPr[] } } }
+  data?: { viewer?: { login: string }; mine?: { nodes: Found[] }; review?: { nodes: Found[] } }
+}
+
+export function listedOf(answer: ListAnswer): { login: string; prs: ListedPr[] } | null {
+  const login = answer.data?.viewer?.login
+
+  if (login === undefined) {
+    return null
+  }
+
+  const prs: ListedPr[] = []
+  const add = (nodes: Found[] | undefined, role: PrRole) => {
+    for (const pr of nodes ?? []) {
+      if (pr.number !== undefined && !pr.isDraft && !prs.some(p => p.url === pr.url)) {
+        prs.push({ ...pr, role })
+      }
+    }
+  }
+
+  add(answer.data?.review?.nodes, 'reviewer')
+  add(answer.data?.mine?.nodes, 'author')
+
+  return { login, prs }
 }
 
 // One aliased query for every listed PR, so a refresh costs two requests.
@@ -157,6 +195,8 @@ export function toTracked(pr: ListedPr, detail: PrDetail): TrackedPr {
 
   return {
     key: `${pr.repository.nameWithOwner}#${pr.number}`,
+    role: pr.role,
+    author: pr.author?.login ?? null,
     number: pr.number,
     title: pr.title,
     url: pr.url,

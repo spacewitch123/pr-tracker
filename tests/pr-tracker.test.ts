@@ -57,7 +57,7 @@ function detail(number: number, f: Fixture, decision: string, opinions: string[]
   }
 }
 
-function world(on: On, f: Fixture, toasts: string[], branch = 'feature/pricing') {
+function world(on: On, f: Fixture, toasts: string[], branch = 'feature/pricing', remote: string | null = 'git@github.com:acme/web.git') {
   const clock = mock.clock(on, { now: 1_000_000 })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
@@ -66,45 +66,47 @@ function world(on: On, f: Fixture, toasts: string[], branch = 'feature/pricing')
     toasts.push(e.text)
     return { value: undefined }
   })
+  const queries: string[] = []
   on('process.run', ($, e) => {
-    const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    const answer = (exitCode: number, stdout: string) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
 
     if (e.argv[0] === 'git') {
-      return ok(`${branch}\n`)
+      if (e.argv[1] === 'remote') {
+        return remote === null ? answer(2, '') : answer(0, `${remote}\n`)
+      }
+      return answer(0, `${branch}\n`)
     }
 
     const query = e.argv.find(a => a.startsWith('query=')) ?? ''
+    queries.push(query)
 
     if (query.includes('viewer')) {
-      return ok(
+      const pr = (number: number, title: string, headRefName: string, author: string, isDraft = false) => ({
+        number, title, url: `https://x/${number}`, isDraft, headRefName, repository: { nameWithOwner: 'acme/web' }, author: { login: author },
+      })
+      return answer(
+        0,
         JSON.stringify({
           data: {
-            viewer: {
-              login: 'me',
-              pullRequests: {
-                totalCount: 5,
-                nodes: [
-                  { number: 368, title: 'Unique form input ids', url: 'https://x/368', isDraft: false, headRefName: 'feature/ids', repository: { nameWithOwner: 'acme/web' } },
-                  { number: 325, title: 'Add a yearly pricing plan', url: 'https://x/325', isDraft: false, headRefName: 'feature/pricing', repository: { nameWithOwner: 'acme/web' } },
-                ],
-              },
-            },
+            viewer: { login: 'me' },
+            mine: { nodes: [pr(368, 'Unique form input ids', 'feature/ids', 'me'), pr(325, 'Add a yearly pricing plan', 'feature/pricing', 'me'), pr(399, 'Half-done proxy work', 'feature/proxy', 'me', true)] },
+            review: { nodes: [pr(412, 'Speed up the booking list', 'feature/speed', 'mir')] },
           },
         }),
       )
     }
 
-    return ok(
-      JSON.stringify({
-        data: {
-          p0: detail(368, { threadComments: [], mergeable: 'MERGEABLE', mergeState: 'CLEAN' }, 'APPROVED', ['APPROVED', 'APPROVED'], 0),
-          p1: detail(325, f, 'CHANGES_REQUESTED', ['APPROVED', 'CHANGES_REQUESTED'], 1),
-        },
-      }),
-    )
+    const details: Record<number, unknown> = {
+      368: detail(368, { threadComments: [], mergeable: 'MERGEABLE', mergeState: 'CLEAN' }, 'APPROVED', ['APPROVED', 'APPROVED'], 0),
+      325: detail(325, f, 'CHANGES_REQUESTED', ['APPROVED', 'CHANGES_REQUESTED'], 1),
+      412: detail(412, { threadComments: [], mergeable: 'MERGEABLE', mergeState: 'BLOCKED' }, 'REVIEW_REQUIRED', [], 1),
+    }
+    const order = [...query.matchAll(/pullRequest\(number: (\d+)\)/g)].map(m => Number(m[1]))
+
+    return answer(0, JSON.stringify({ data: Object.fromEntries(order.map((n, i) => [`p${i}`, details[n] ?? null])) }))
   })
 
-  return clock
+  return { clock, queries }
 }
 
 async function texts(ui: { findAll: (q: { type: string }) => Promise<Array<{ text?: string }>> }) {
@@ -129,19 +131,21 @@ test('required checks count only required ones, reruns counted once', () => {
 
 test('the bar shows reviews, required checks, conflicts and readiness, current branch first', async ($, on) => {
   const toasts: string[] = []
-  const clock = world(on, { threadComments: [], mergeable: 'CONFLICTING', mergeState: 'DIRTY' }, toasts)
+  const { clock } = world(on, { threadComments: [], mergeable: 'CONFLICTING', mergeState: 'DIRTY' }, toasts)
   await start($)
   await clock.advance(10)
 
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ ...BAND, surface })
     const all = await texts(ui)
-    expect(all).toMatch(/⎇ Pull requests  5 open/)
+    expect(all).toMatch(/⎇ web  2 yours · 1 to review/)
     expect(all).toMatch(/▶ #325 Add a yearly pricing plan/)
     expect(all).toMatch(/#325.*✔1 ✖1 ◷1  req ✔1 ✖1 ◷1  ⚠   CONFLICTS /)
+    expect(all).toMatch(/◎ #412 Speed up the booking list · @mir/)
     expect(all).toMatch(/• #368 Unique form input ids.*✔2 ✖0 ◷0.* READY /)
-    expect(all).toMatch(/\+3 more · type \/prs to see them all/)
-    expect(all.indexOf('#325') < all.indexOf('#368')).toBe(true)
+    expect(all).not.toMatch(/#399/)
+    expect(all.indexOf('#325') < all.indexOf('#412')).toBe(true)
+    expect(all.indexOf('#412') < all.indexOf('#368')).toBe(true)
     await ui.unmount()
   }
 
@@ -151,7 +155,7 @@ test('the bar shows reviews, required checks, conflicts and readiness, current b
 test('a new review comment raises a toast, old ones never do', async ($, on) => {
   const toasts: string[] = []
   const fixture = { threadComments: [{ id: 'c1', body: 'old note', who: 'mir' }], mergeable: 'MERGEABLE', mergeState: 'BLOCKED' }
-  const clock = world(on, fixture, toasts)
+  const { clock } = world(on, fixture, toasts)
   await start($)
   await clock.advance(10)
   expect(toasts).toHaveLength(0)
@@ -164,12 +168,13 @@ test('a new review comment raises a toast, old ones never do', async ($, on) => 
 
 test('/prs lists every PR and /prs off hides the bar', async ($, on) => {
   const toasts: string[] = []
-  const clock = world(on, { threadComments: [], mergeable: 'MERGEABLE', mergeState: 'BLOCKED' }, toasts)
+  const { clock } = world(on, { threadComments: [], mergeable: 'MERGEABLE', mergeState: 'BLOCKED' }, toasts)
   await start($)
   await clock.advance(10)
 
   const listed = await $.command.run({ command: 'prs', args: '' } as never)
-  expect(listed.text).toMatch(/#325 Add a yearly pricing plan · acme\/web/)
+  expect(listed.text).toMatch(/Pull requests in acme\/web/)
+  expect(listed.text).toMatch(/#412 Speed up the booking list · waiting on your review \(by mir\)/)
   expect(listed.text).toMatch(/BLOCKED \(changes requested\)/)
 
   await $.command.run({ command: 'prs', args: 'off' } as never)
@@ -183,11 +188,35 @@ test('a missing sign-in shows a calm hint instead of breaking', async ($, on) =>
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'engine', ref: 0 }))
-  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: 'To get started with GitHub CLI, please run: gh auth login', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.run', ($, e) =>
+    e.argv[0] === 'git'
+      ? { value: { exitCode: 0, stdout: 'https://github.com/acme/web.git\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      : { value: { exitCode: 1, stdout: '', stderr: 'To get started with GitHub CLI, please run: gh auth login', isStdoutTruncated: false, isStderrTruncated: false } },
+  )
   await start($)
   await clock.advance(10)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await texts(ui)).toMatch(/sign in with: gh auth login/)
   await ui.unmount()
+})
+
+test('asks GitHub only for this project, your PRs and your reviews, never drafts', async ($, on) => {
+  const { clock, queries } = world(on, { threadComments: [], mergeable: 'MERGEABLE', mergeState: 'CLEAN' }, [])
+  await start($)
+  await clock.advance(10)
+  const list = queries.find(q => q.includes('viewer')) ?? ''
+  expect(list).toMatch(/repo:acme\/web is:pr is:open draft:false author:@me/)
+  expect(list).toMatch(/repo:acme\/web is:pr is:open draft:false review-requested:@me/)
+})
+
+test('outside a GitHub project the bar stays hidden', async ($, on) => {
+  const { clock } = world(on, { threadComments: [], mergeable: 'MERGEABLE', mergeState: 'CLEAN' }, [], 'main', null)
+  await start($)
+  await clock.advance(10)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await texts(ui)).toBe('')
+  await ui.unmount()
+  expect((await $.command.run({ command: 'prs', args: '' } as never)).text).toMatch(/isn't a GitHub project/)
 })

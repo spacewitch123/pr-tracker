@@ -4,6 +4,8 @@ export type PrReadiness = 'ready' | 'blocked' | 'conflicts' | 'behind' | 'unstab
 
 export type TrackedPr = {
   key: string
+  role: 'author' | 'reviewer'
+  author: string | null
   number: number
   title: string
   url: string
@@ -25,6 +27,7 @@ declare module 'claude-code' {
     'pr-tracker': {
       prs: TrackedPr[]
       totalOpen: number
+      repo: string | null
       branch: string | null
       syncedAt: number | null
       error: string | null

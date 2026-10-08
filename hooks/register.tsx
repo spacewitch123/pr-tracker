@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderElement } from 'claude-code'
 
 import type { PrReadiness, TrackedPr } from '../types'
-import { detailQuery, LIST_QUERY, notesOf, since, toastFor, toTracked } from './pr-core'
+import { detailQuery, listedOf, listQuery, notesOf, repoFromRemote, since, toastFor, toTracked } from './pr-core'
 import type { ListAnswer, PrDetail } from './pr-core'
 
 type Engine = EngineInterface
@@ -20,6 +20,7 @@ const WAIT = '#d97706'
 
 const prsAtom = atom({ plugin: 'pr-tracker', key: 'prs' } as const, [])
 const totalAtom = atom({ plugin: 'pr-tracker', key: 'totalOpen' } as const, 0)
+const repoAtom = atom({ plugin: 'pr-tracker', key: 'repo' } as const, null)
 const branchAtom = atom({ plugin: 'pr-tracker', key: 'branch' } as const, null)
 const syncedAtom = atom({ plugin: 'pr-tracker', key: 'syncedAt' } as const, null)
 const errorAtom = atom({ plugin: 'pr-tracker', key: 'error' } as const, null)
@@ -55,6 +56,24 @@ async function currentBranch($: Engine): Promise<string | null> {
   }
 }
 
+// The GitHub project of the folder Claude Code runs in: origin, else upstream.
+async function currentRepo($: Engine): Promise<string | null> {
+  for (const remote of ['origin', 'upstream']) {
+    try {
+      const ran = await $.process.run(['git', 'remote', 'get-url', remote], { timeoutMs: 5_000 })
+      const repo = ran.exitCode === 0 ? repoFromRemote(ran.stdout) : null
+
+      if (repo !== null) {
+        return repo
+      }
+    } catch {
+      return null
+    }
+  }
+
+  return null
+}
+
 async function poll($: Engine): Promise<void> {
   if (isPolling) {
     return
@@ -63,15 +82,26 @@ async function poll($: Engine): Promise<void> {
   isPolling = true
 
   try {
-    const branch = await currentBranch($)
-    const listed = (await graphql($, LIST_QUERY)) as ListAnswer
-    const viewer = listed.data?.viewer
+    const repo = await currentRepo($)
+    await update($, repoAtom, () => repo)
 
-    if (viewer === undefined) {
+    if (repo === null) {
+      const now = await $.clock.now()
+      await update($, prsAtom, () => [])
+      await update($, totalAtom, () => 0)
+      await update($, errorAtom, () => null)
+      await update($, syncedAtom, () => now)
+      return
+    }
+
+    const branch = await currentBranch($)
+    const viewer = listedOf((await graphql($, listQuery(repo))) as ListAnswer)
+
+    if (viewer === null) {
       throw new Error('GitHub gave no answer')
     }
 
-    const nodes = viewer.pullRequests.nodes
+    const nodes = viewer.prs
     const details =
       nodes.length === 0
         ? {}
@@ -109,7 +139,7 @@ async function poll($: Engine): Promise<void> {
     })
 
     await update($, prsAtom, () => prs)
-    await update($, totalAtom, () => viewer.pullRequests.totalCount)
+    await update($, totalAtom, () => prs.length)
     await update($, branchAtom, () => branch)
     const now = await $.clock.now()
     await update($, syncedAtom, () => now)
@@ -155,10 +185,11 @@ const PILLS: Record<PrReadiness, { text: string; color: string }> = {
   checking: { text: ' CHECKING ', color: '#64748b' },
 }
 
+// Your branch first, then reviews waiting on you, then the rest of yours.
 function ordered(prs: readonly TrackedPr[], branch: string | null): TrackedPr[] {
-  const mine = prs.filter(p => p.branch === branch)
+  const rank = (p: TrackedPr) => (p.branch === branch && p.role === 'author' ? 0 : p.role === 'reviewer' ? 1 : 2)
 
-  return [...mine, ...prs.filter(p => p.branch !== branch)]
+  return [...prs].sort((a, b) => rank(a) - rank(b))
 }
 
 function summaryLine(pr: TrackedPr): string {
@@ -166,7 +197,9 @@ function summaryLine(pr: TrackedPr): string {
   const checks = `${pr.checks.isRequiredOnly ? 'required' : 'checks'} ✔${pr.checks.passed} ✖${pr.checks.failed} ◷${pr.checks.pending}`
   const state = PILLS[pr.readiness].text.trim() + (pr.blockedBecause ? ` (${pr.blockedBecause})` : '')
 
-  return `#${pr.number} ${pr.title} · ${pr.repo}\n   reviews ${reviews} · ${checks} · ${state}\n   ${pr.url}`
+  const whose = pr.role === 'reviewer' ? ` · waiting on your review (by ${pr.author ?? 'someone'})` : ''
+
+  return `#${pr.number} ${pr.title}${whose}\n   reviews ${reviews} · ${checks} · ${state}\n   ${pr.url}`
 }
 
 export const register: Register = on => {
@@ -206,20 +239,30 @@ export const register: Register = on => {
     const prs = await read($, prsAtom)
     const error = await read($, errorAtom)
     const synced = await read($, syncedAtom)
+    const repo = await read($, repoAtom)
+
+    if (synced !== null && repo === null) {
+      return { text: "This folder isn't a GitHub project, so PR Tracker has nothing to show here." }
+    }
 
     if (error !== null) {
       return { text: `PR Tracker: ${error}.` }
     }
 
     if (prs.length === 0) {
-      return { text: synced === null ? 'PR Tracker is still loading.' : 'You have no open pull requests.' }
+      return {
+        text:
+          synced === null
+            ? 'PR Tracker is still loading.'
+            : `No open pull requests of yours, or waiting on your review, in ${repo}.`,
+      }
     }
 
     const branch = await read($, branchAtom)
     const lines = ordered(prs, branch).map(summaryLine)
     const now = await $.clock.now()
 
-    return { text: `Your open pull requests (synced ${since(now - (synced ?? now))}):\n\n${lines.join('\n\n')}` }
+    return { text: `Pull requests in ${repo} (synced ${since(now - (synced ?? now))}):\n\n${lines.join('\n\n')}` }
   })
 
   // A push or a PR command by Claude: look again shortly, not in a minute.
@@ -247,6 +290,13 @@ export const register: Register = on => {
     const branch = await read($, branchAtom)
     const synced = await read($, syncedAtom)
     const error = await read($, errorAtom)
+    const repo = await read($, repoAtom)
+
+    // Outside a GitHub project there is nothing to track: stay out of the way.
+    if (synced !== null && repo === null) {
+      return below
+    }
+
     const { Box, Text } = $.ui.resolve(e)
     const columns = Math.max(30, e.props.bodyColumns)
     const isNarrow = columns < 90
@@ -255,9 +305,13 @@ export const register: Register = on => {
       <Box flexDirection="row" justifyContent="space-between">
         <Box flexDirection="row">
           <Text color={ACCENT} bold>
-            {'⎇ Pull requests'}
+            {`⎇ ${repo === null ? 'Pull requests' : (repo.split('/')[1] ?? repo)}`}
           </Text>
-          <Text dimColor>{synced === null ? '  loading…' : `  ${total} open`}</Text>
+          <Text dimColor>
+            {synced === null
+              ? '  loading…'
+              : `  ${prs.filter(p => p.role === 'author').length} yours · ${prs.filter(p => p.role === 'reviewer').length} to review`}
+          </Text>
         </Box>
         {error !== null ? <Text color={WAIT}>{`● ${error}`}</Text> : <Text color={GOOD}>{synced === null ? '' : '● live'}</Text>}
       </Box>
@@ -265,7 +319,9 @@ export const register: Register = on => {
 
     const shown = ordered(prs, branch).slice(0, SHOWN)
     const rows = shown.map(pr => {
-      const isHere = pr.branch === branch
+      const isHere = pr.branch === branch && pr.role === 'author'
+      const isReview = pr.role === 'reviewer'
+      const by = isReview ? ` · @${pr.author ?? 'someone'}` : ''
       const pill = PILLS[pr.readiness]
       const why = pr.blockedBecause === null || isNarrow ? '' : ` ${pr.blockedBecause}`
       const reviews = isNarrow
@@ -275,17 +331,20 @@ export const register: Register = on => {
         ? `  ${pr.checks.passed}/${pr.checks.total}`
         : `  ${pr.checks.isRequiredOnly ? 'req' : 'checks'} ✔${pr.checks.passed} ✖${pr.checks.failed} ◷${pr.checks.pending}`
       const conflict = pr.hasConflicts ? '  ⚠' : ''
-      const fixed = 2 + `#${pr.number} `.length + reviews.length + checks.length + conflict.length + 2 + pill.text.length + why.length
+      const fixed = 2 + by.length + `#${pr.number} `.length + reviews.length + checks.length + conflict.length + 2 + pill.text.length + why.length
       const room = Math.max(6, columns - fixed)
-      const title = pr.title.length > room ? `${pr.title.slice(0, room - 1)}…` : pr.title.padEnd(room)
+      const title = pr.title.length > room ? `${pr.title.slice(0, room - 1)}…` : pr.title
+      const pad = ' '.repeat(Math.max(0, room - title.length))
 
       return (
         <Box flexDirection="row">
-          <Text color={isHere ? ACCENT : undefined} dimColor={!isHere}>
-            {isHere ? '▶ ' : '• '}
+          <Text color={isHere ? ACCENT : isReview ? WAIT : undefined} dimColor={!isHere && !isReview}>
+            {isHere ? '▶ ' : isReview ? '◎ ' : '• '}
           </Text>
           <Text bold>{`#${pr.number} `}</Text>
-          <Text dimColor={!isHere}>{title}</Text>
+          <Text dimColor={!isHere && !isReview}>{title}</Text>
+          <Text color={WAIT}>{by}</Text>
+          <Text>{pad}</Text>
           <Text color={pr.changesRequested > 0 ? BAD : pr.approvals > 0 ? GOOD : WAIT}>{reviews}</Text>
           <Text color={pr.checks.failed > 0 ? BAD : pr.checks.pending > 0 ? WAIT : GOOD}>{checks}</Text>
           <Text color={BAD} bold>
@@ -302,7 +361,7 @@ export const register: Register = on => {
 
     const more =
       total > shown.length ? [<Text dimColor>{`  +${total - shown.length} more · type /prs to see them all`}</Text>] : []
-    const empty = synced !== null && prs.length === 0 && error === null ? [<Text dimColor>{'  No open pull requests'}</Text>] : []
+    const empty = synced !== null && prs.length === 0 && error === null ? [<Text dimColor>{'  Nothing open that you wrote or need to review'}</Text>] : []
 
     const bar: RenderElement = (
       <Box flexDirection="column">
