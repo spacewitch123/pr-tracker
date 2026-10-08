@@ -1,0 +1,8 @@
+{
+  "name": "pr-tracker",
+  "version": "1.0.0",
+  "description": "A pinned bar above the prompt with your open pull requests: reviews, required checks, conflicts and merge readiness, plus toasts for new review comments.",
+  "author": { "name": "spacewitch123" },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

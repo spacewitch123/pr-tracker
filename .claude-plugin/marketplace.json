@@ -1,0 +1,6 @@
+{
+  "name": "pr-tracker",
+  "description": "PR Tracker: your pull requests' review and merge status, pinned above the prompt.",
+  "owner": { "name": "spacewitch123" },
+  "plugins": [{ "name": "pr-tracker", "source": "./" }]
+}
